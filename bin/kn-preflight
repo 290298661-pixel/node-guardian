@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# ====================================================================
+# node-guardian: kn-preflight
+# 节点准入预检与环境标准化工具
+# ====================================================================
+
+# 1. 相对路径解析，确保在任何目录下执行都能正确 source
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+readonly LIB_DIR
+CONFIG_DIR="$(dirname "$SCRIPT_DIR")/config"
+readonly CONFIG_DIR
+
+# 2. 引入基础库
+if [ ! -f "${LIB_DIR}/core.sh" ]; then
+    echo "ERROR: 找不到核心库 ${LIB_DIR}/core.sh" >&2
+    exit 1
+fi
+# shellcheck disable=SC1091
+source "${LIB_DIR}/core.sh"
+# shellcheck disable=SC1091
+source "${LIB_DIR}/sysctl.sh"
+# shellcheck disable=SC1091
+source "${LIB_DIR}/k8s-utils.sh"
+# shellcheck disable=SC1091
+source "${LIB_DIR}/network.sh"
+
+# 3. 帮助文档定义
+usage() {
+    cat <<EOF
+用法: kn-preflight [选项]
+
+云原生节点准入预检工具，用于初始化或审计 K8s 节点的系统与内核参数。
+
+选项:
+  -h, --help       显示此帮助信息并退出
+  -v, --version    显示版本号并退出
+  --dry-run        预演模式，仅打印将要执行的修改动作，不实际修改系统
+  --json           以 JSON 格式输出结果（终端日志将被静默）
+EOF
+}
+
+# 4. 命令行参数解析
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -v|--version)
+            echo "kn-preflight v${VERSION}"
+            exit 0
+            ;;
+        --dry-run)
+            export DRY_RUN=true
+            log_warn "DRY_RUN 模式已开启，不会对系统进行实质性修改。"
+            shift
+            ;;
+        --json)
+            export JSON_OUTPUT=true
+            shift
+            ;;
+        *)
+            log_error "未知参数: $1"
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+# 5. 主执行逻辑编排
+main() {
+    # 日志轮转：清理 30 天前的旧日志
+    cleanup_old_logs 30
+
+    log_info "=== 开始节点准入预检流程 ==="
+
+    # 阶段 1: 前置检查
+    require_root
+
+    # 阶段 2: 内核参数审计与调优
+    local sysctl_conf="${CONFIG_DIR}/sysctl_baseline.env"
+    apply_sysctl_baseline "$sysctl_conf"
+
+    # 阶段 3: 容器运行时检测
+    detect_container_runtime || log_warn "容器运行时检测未通过，部分功能可能受限。"
+
+    # 阶段 4: 网络连通性预检 (MTU 一致性)
+    check_mtu_consistency
+
+    log_info "=== 节点准入预检流程结束 ==="
+
+    # JSON 模式：刷出结构化报告
+    if [ "$JSON_OUTPUT" = true ]; then
+        json_flush
+    fi
+}
+
+# 启动主函数
+main
