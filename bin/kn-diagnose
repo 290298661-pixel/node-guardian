@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+# ====================================================================
+# node-guardian: kn-diagnose
+# 「黄金五分钟」集群节点快速排障入口
+# ====================================================================
+
+# 1. 路径解析
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+readonly LIB_DIR
+
+# 2. 引入基础库
+if [ ! -f "${LIB_DIR}/core.sh" ]; then
+    echo "ERROR: 找不到核心库 ${LIB_DIR}/core.sh" >&2
+    exit 1
+fi
+# shellcheck disable=SC1091
+source "${LIB_DIR}/core.sh"
+# shellcheck disable=SC1091
+source "${LIB_DIR}/k8s-utils.sh"
+# shellcheck disable=SC1091
+source "${LIB_DIR}/network.sh"
+
+# 3. 默认参数
+LOG_MINUTES=15
+TOP_N=3
+
+usage() {
+    cat <<EOF
+用法: kn-diagnose [选项]
+
+「黄金五分钟」集群节点快速排障工具。在节点 NotReady 或网络异常时，
+一键获取系统负载、Pod 溯源、Conntrack 状态及关键错误日志。
+
+选项:
+  -h, --help         显示此帮助信息并退出
+  -v, --version      显示版本号并退出
+  --dry-run          预演模式（诊断流程为只读操作，此模式仅影响日志输出）
+  --minutes <N>      关键日志回溯时间窗口，默认 ${LOG_MINUTES} 分钟
+  --top <N>          展示内存占用最高的 N 个进程，默认 ${TOP_N}
+  --json             以 JSON 格式输出诊断报告（终端日志将被静默）
+EOF
+}
+
+# 4. 参数解析
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -v|--version)
+            echo "kn-diagnose v${VERSION}"
+            exit 0
+            ;;
+        --dry-run)
+            export DRY_RUN=true
+            log_warn "DRY_RUN 模式已开启。"
+            shift
+            ;;
+        --json)
+            export JSON_OUTPUT=true
+            shift
+            ;;
+        --minutes)
+            LOG_MINUTES="$2"
+            if ! [[ "$LOG_MINUTES" =~ ^[1-9][0-9]*$ ]]; then
+                log_error "--minutes 需要正整数，收到: ${LOG_MINUTES}"
+                exit 1
+            fi
+            shift 2
+            ;;
+        --top)
+            TOP_N="$2"
+            if ! [[ "$TOP_N" =~ ^[1-9][0-9]*$ ]]; then
+                log_error "--top 需要正整数，收到: ${TOP_N}"
+                exit 1
+            fi
+            shift 2
+            ;;
+        *)
+            log_error "未知参数: $1"
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+# ------------------------------------------------------------------
+# 辅助：获取系统负载快照
+# ------------------------------------------------------------------
+gather_system_load() {
+    local top_n="$1"
+
+    if [ "$JSON_OUTPUT" != true ]; then
+    # === 系统概览 ===
+    echo ""
+    echo "  ██████████████████████████████████████████████████████████████"
+    echo "  ▎              节点健康快照 (Node Health Snapshot)         ▎"
+    echo "  ██████████████████████████████████████████████████████████████"
+    echo ""
+
+    # 主机名 + 运行时间
+    printf "  %-20s %s\n" "Hostname:" "$(hostname)"
+    printf "  %-20s %s\n" "Uptime:" "$(uptime -p 2>/dev/null || uptime | awk -F'up' '{print "up" $2}' | sed 's/,  load.*//')"
+    printf "  %-20s %s\n" "Kernel:" "$(uname -r)"
+    fi
+
+    # Load Average
+    if [ "$JSON_OUTPUT" != true ]; then
+    local load_avg="" load_1m="" cpu_cores=""
+    load_avg=$(cat /proc/loadavg 2>/dev/null || echo "0 0 0")
+    load_1m=$(echo "$load_avg" | awk '{print $1}')
+    cpu_cores=$(nproc 2>/dev/null || echo 1)
+    printf "  %-20s %s (核数: %s)\n" "Load Average:" "$load_1m" "$cpu_cores"
+
+    # 负载告警
+    if [ "${load_1m%.*}" -gt "$cpu_cores" ] 2>/dev/null; then
+        log_warn "  ⚠  1 分钟负载 (${load_1m}) 超过 CPU 核数 (${cpu_cores})，系统可能过载。"
+    fi
+
+    # Memory
+    local mem_total="" mem_avail="" mem_used_pct=""
+    while IFS=':' read -r key val; do
+        case "$key" in
+            MemTotal) mem_total=$(echo "$val" | awk '{print $1}') ;;
+            MemAvailable) mem_avail=$(echo "$val" | awk '{print $1}') ;;
+        esac
+    done < /proc/meminfo
+    if [ -n "$mem_total" ] && [ -n "$mem_avail" ]; then
+        mem_used_pct=$(( (mem_total - mem_avail) * 100 / mem_total ))
+        printf "  %-20s %s%% (已用) \n" "Memory:" "$mem_used_pct"
+        if [ "$mem_used_pct" -ge 90 ]; then
+            log_error "  ⚠  内存使用率 >= 90%，OOM 风险极高。"
+        elif [ "$mem_used_pct" -ge 75 ]; then
+            log_warn "  ⚠  内存使用率 >= 75%，建议关注。"
+        fi
+    fi
+
+    # Disk
+    printf "  %-20s \n" "Disk Usage:"
+    df -h / /var/lib/containerd /var/lib/docker /var/lib/kubelet 2>/dev/null \
+        | awk 'NR>1 {printf "    %-30s %s/%s (%s)\n", $6, $3, $2, $5}' \
+        || log_warn "  无法获取磁盘使用率。"
+
+    echo ""
+
+    # === 内存占用 Top N ===
+    printf "  ▎ 内存占用 Top %s 进程:\n" "$top_n"
+    printf "  %-8s %-6s %-8s %-20s\n" "PID" "RSS(M)" "%MEM" "COMMAND"
+    printf "  %-8s %-6s %-8s %-20s\n" "---" "-----" "-----" "-------"
+
+    ps aux --sort=-%mem 2>/dev/null | awk -v n="$top_n" 'NR>1 && NR<=n+1 {
+        rss=$6/1024
+        printf "  %-8s %-6.0f %-8s %-20s\n", $2, rss, $4, $11
+    }'
+
+    fi
+    # 返回 Top N PID 列表
+    ps aux --sort=-%mem 2>/dev/null | awk -v n="$top_n" 'NR>1 && NR<=n+1 {print $2}'
+}
+
+# ------------------------------------------------------------------
+# 辅助：输出排障建议
+# ------------------------------------------------------------------
+emit_recommendations() {
+    if [ "$JSON_OUTPUT" = true ]; then
+        return 0
+    fi
+    echo ""
+    echo "  ██████████████████████████████████████████████████████████████"
+    echo "  ▎               排障建议 (Recommendations)                  ▎"
+    echo "  ██████████████████████████████████████████████████████████████"
+    echo ""
+    echo "  1. 若高负载进程可追溯到 Pod，考虑对该 Pod 设置 resource limits。"
+    echo "  2. 若 Conntrack 使用率 > 85%，检查是否有短连接风暴或 TIME_WAIT 堆积。"
+    echo "  3. 若 MTU 不一致，检查 CNI 配置中的 MTU 设置与物理网卡对齐。"
+    echo "  4. 若 kubelet/containerd 日志含 'timeout' 或 'deadline'，"
+    echo "     检查 API Server 可达性及节点证书有效期。"
+    echo "  5. 若出现 OOM Kill，立即检查 node-allocatable 与 Pod request/limit 配置。"
+    echo ""
+}
+
+# ------------------------------------------------------------------
+# 5. 主诊断编排
+# ------------------------------------------------------------------
+main() {
+    # 日志轮转
+    cleanup_old_logs 30
+
+    log_info "========== 节点快速排障启动 =========="
+
+    # 阶段 1: 系统负载
+    log_info "[阶段 1/4] 收集系统负载数据..."
+    local top_pids
+    top_pids=$(gather_system_load "$TOP_N")
+
+    json_record "system_load" "completed" "系统负载快照已收集" \
+        "load_1m=$(awk '{print $1}' /proc/loadavg 2>/dev/null)" \
+        "cpu_cores=$(nproc 2>/dev/null)" \
+        "memory_used_pct=$(awk '/MemTotal/{t=$2}/MemAvailable/{a=$2}END{printf "%d",(t-a)*100/t}' /proc/meminfo 2>/dev/null)"
+
+    # 阶段 2: Pod 溯源
+    if [ "$JSON_OUTPUT" != true ]; then
+    echo ""
+    echo "  ██████████████████████████████████████████████████████████████"
+    echo "  ▎              Pod 溯源 (Pod Traceback)                     ▎"
+    echo "  ██████████████████████████████████████████████████████████████"
+    fi
+    echo ""
+    log_info "[阶段 2/4] 逆向追踪高负载进程 → K8s Pod..."
+    local trace_count=0
+    if [ -n "$top_pids" ]; then
+        for pid in $top_pids; do
+            find_pod_by_pid "$pid" || true
+            trace_count=$((trace_count + 1))
+            echo ""
+        done
+    else
+        log_warn "  无法获取进程列表，跳过 Pod 溯源。"
+    fi
+    json_record "pod_traceback" "completed" "已溯源 ${trace_count} 个进程" \
+        "processes_traced=${trace_count}"
+
+    # 阶段 3: 网络诊断
+    if [ "$JSON_OUTPUT" != true ]; then
+    echo ""
+    echo "  ██████████████████████████████████████████████████████████████"
+    echo "  ▎              网络诊断 (Network Diagnostics)               ▎"
+    echo "  ██████████████████████████████████████████████████████████████"
+    fi
+    echo ""
+    log_info "[阶段 3/4] 执行网络诊断..."
+    check_mtu_consistency
+    echo ""
+    analyze_conntrack
+    json_record "network_diag" "completed" "网络诊断完成"
+
+    # 阶段 4: 关键日志提取
+    echo ""
+    echo "  ██████████████████████████████████████████████████████████████"
+    echo "  ▎           关键错误日志 (Critical Error Logs)              ▎"
+    echo "  ██████████████████████████████████████████████████████████████"
+    echo ""
+    log_info "[阶段 4/4] 提取底层组件关键错误日志..."
+    extract_critical_logs "$LOG_MINUTES"
+    json_record "critical_logs" "completed" "关键日志提取完成" \
+        "time_window_minutes=${LOG_MINUTES}"
+
+    # 排障建议
+    emit_recommendations
+
+    log_info "========== 排障报告输出完毕 =========="
+
+    if [ "$JSON_OUTPUT" = true ]; then
+        json_flush
+    fi
+}
+
+main
