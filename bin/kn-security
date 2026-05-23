@@ -1,0 +1,348 @@
+#!/usr/bin/env bash
+# ====================================================================
+# node-guardian: kn-security
+# 云原生节点安全加固审计入口
+# ====================================================================
+
+# 1. 路径解析
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+readonly LIB_DIR
+CONFIG_DIR="$(dirname "$SCRIPT_DIR")/config"
+readonly CONFIG_DIR
+
+# 2. 引入基础库
+if [ ! -f "${LIB_DIR}/core.sh" ]; then
+    echo "ERROR: 找不到核心库 ${LIB_DIR}/core.sh" >&2
+    exit 1
+fi
+# shellcheck disable=SC1091
+source "${LIB_DIR}/core.sh"
+
+# 3. 默认参数
+CIS_CONFIG="${CONFIG_DIR}/cis_rules.cfg"
+ISSUES_FOUND=0
+
+usage() {
+    cat <<EOF
+用法: kn-security [选项]
+
+云原生节点安全审计工具。基于 CIS 基线检查 kubelet 配置、高危端口
+监听及安全服务状态。所有检查均为只读操作，支持 Dry-Run 模式。
+
+选项:
+  -h, --help         显示此帮助信息并退出
+  -v, --version      显示版本号并退出
+  --config <path>    指定 CIS 规则配置文件，默认 ${CIS_CONFIG}
+  --dry-run          预演模式，仅打印检查项，不输出修复命令
+  --json             以 JSON 格式输出审计报告（终端日志将被静默）
+EOF
+}
+
+# 4. 参数解析
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -v|--version)
+            echo "kn-security v${VERSION}"
+            exit 0
+            ;;
+        --dry-run)
+            export DRY_RUN=true
+            log_warn "DRY_RUN 模式已开启。"
+            shift
+            ;;
+        --json)
+            export JSON_OUTPUT=true
+            shift
+            ;;
+        --config)
+            CIS_CONFIG="$2"
+            shift 2
+            ;;
+        *)
+            log_error "未知参数: $1"
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+# ------------------------------------------------------------------
+# 解析 CIS 规则文件，返回匹配的键值对
+# ------------------------------------------------------------------
+parse_cis_rules() {
+    local config_file="$1"
+    local prefix="$2"
+
+    if [ ! -f "$config_file" ]; then
+        log_error "CIS 规则文件不存在: $config_file"
+        return 1
+    fi
+
+    grep "^${prefix}=" "$config_file" 2>/dev/null | sed "s/^${prefix}=//"
+}
+
+# ------------------------------------------------------------------
+# 阶段 1: Kubelet 安全参数审计
+# ------------------------------------------------------------------
+audit_kubelet_config() {
+    log_info "[阶段 1/3] Kubelet 安全参数审计..."
+    log_warn "============================================================"
+
+    if ! command -v kubelet >/dev/null 2>&1; then
+        log_warn "  未检测到 kubelet，跳过 K8s 节点安全检查。"
+        return 0
+    fi
+
+    local kubelet_config=""
+    # 尝试多个可能的 kubelet 配置文件路径
+    for candidate in /var/lib/kubelet/config.yaml /etc/kubernetes/kubelet.conf /etc/default/kubelet; do
+        if [ -f "$candidate" ]; then
+            kubelet_config="$candidate"
+            break
+        fi
+    done
+
+    # 从进程参数获取配置路径
+    if [ -z "$kubelet_config" ]; then
+        # shellcheck disable=SC2009
+        kubelet_config=$(ps aux 2>/dev/null | grep kubelet | grep -oP '\-\-config=\K\S+' | head -1 || echo "")
+    fi
+
+    if [ -z "$kubelet_config" ] || [ ! -f "$kubelet_config" ]; then
+        log_warn "  无法定位 kubelet 配置文件，跳过参数审计。"
+        log_info "  提示: 使用 --config 参数指定 kubelet 配置文件路径。"
+        return 0
+    fi
+
+    log_info "  Kubelet 配置: $kubelet_config"
+
+    while IFS= read -r rule_line; do
+        [ -z "$rule_line" ] && continue
+        local param_name="${rule_line%%=*}"
+        local expected_val="${rule_line#*=}"
+        # 去掉 KUBELET_CHECK_ 前缀
+        param_name="${param_name#KUBELET_CHECK_}"
+
+        # 读取 kubelet 配置中的实际值
+        local actual_val=""
+        case "$param_name" in
+            anonymous-auth)
+                actual_val=$(grep -P '^\s*anonymous-auth:\s*\K\w+' "$kubelet_config" 2>/dev/null || echo "N/A")
+                ;;
+            read-only-port)
+                actual_val=$(grep -P '^\s*readOnlyPort:\s*\K\d+' "$kubelet_config" 2>/dev/null || echo "N/A")
+                # 也检查命令行参数
+                if [ "$actual_val" = "N/A" ]; then
+                    # shellcheck disable=SC2009
+                    actual_val=$(ps aux 2>/dev/null | grep kubelet | grep -oP '\-\-read-only-port=\K\d+' | head -1 || echo "N/A")
+                fi
+                ;;
+            authorization-mode)
+                actual_val=$(grep -P '^\s*authorization-mode:\s*\K\w+' "$kubelet_config" 2>/dev/null || echo "N/A")
+                if [ "$actual_val" = "N/A" ]; then
+                    # shellcheck disable=SC2009
+                    actual_val=$(ps aux 2>/dev/null | grep kubelet | grep -oP '\-\-authorization-mode=\K\w+' | head -1 || echo "N/A")
+                fi
+                ;;
+            *)
+                log_info "    跳过未知检查项: $param_name"
+                continue
+                ;;
+        esac
+
+        actual_val=$(echo "$actual_val" | xargs)
+
+        if [ "$actual_val" = "$expected_val" ]; then
+            log_success "  [PASS] kubelet --${param_name}=${actual_val}"
+        else
+            log_error "  [FAIL] kubelet --${param_name}: 当前=${actual_val}, 期望=${expected_val}"
+            ISSUES_FOUND=$((ISSUES_FOUND + 1))
+            # 生成修复建议
+            case "$param_name" in
+                anonymous-auth)
+                    log_warn "    → 修复: 在 kubelet 配置中设置 anonymous-auth: ${expected_val}"
+                    ;;
+                read-only-port)
+                    log_warn "    → 修复: 在 kubelet 配置中设置 readOnlyPort: ${expected_val}"
+                    ;;
+                authorization-mode)
+                    log_warn "    → 修复: 在 kubelet 配置中设置 authorization-mode: ${expected_val}"
+                    ;;
+            esac
+        fi
+    done < <(parse_cis_rules "$CIS_CONFIG" "KUBELET_CHECK_")
+
+    log_warn "============================================================"
+}
+
+# ------------------------------------------------------------------
+# 阶段 2: 高危端口监听扫描
+# ------------------------------------------------------------------
+scan_risk_ports() {
+    log_info "[阶段 2/3] 高危端口监听扫描..."
+    log_warn "============================================================"
+
+    local port_entries
+    port_entries=$(parse_cis_rules "$CIS_CONFIG" "RISK_PORT")
+    if [ -z "$port_entries" ]; then
+        log_warn "  未配置风险端口规则，跳过扫描。"
+        return 0
+    fi
+
+    while IFS= read -r entry; do
+        [ -z "$entry" ] && continue
+        local port="${entry%%:*}"
+        local rest="${entry#*:}"
+        local proto="${rest%%:*}"
+        local desc="${rest#*:}"
+
+        # 检查端口是否在监听
+        local listening=""
+        case "$proto" in
+            TCP)
+                listening=$(ss -tlnp 2>/dev/null | grep -E ":${port}\s" || true)
+                ;;
+            UDP)
+                listening=$(ss -ulnp 2>/dev/null | grep -E ":${port}\s" || true)
+                ;;
+            *)
+                listening=$(ss -tlnp 2>/dev/null | grep -E ":${port}\s" || true)
+                ;;
+        esac
+
+        if [ -n "$listening" ]; then
+            local proc_info=""
+            proc_info=$(echo "$listening" | awk '{print $NF}' | head -1)
+            log_error "  [FAIL] 端口 ${port}/${proto} 在监听 — ${desc} (进程: ${proc_info})"
+            log_warn "    → 修复: 停止相关服务或使用防火墙规则限制访问。"
+            ISSUES_FOUND=$((ISSUES_FOUND + 1))
+        else
+            log_success "  [PASS] 端口 ${port}/${proto} 未监听 — ${desc}"
+        fi
+    done <<< "$port_entries"
+
+    log_warn "============================================================"
+}
+
+# ------------------------------------------------------------------
+# 阶段 3: 安全服务状态检查
+# ------------------------------------------------------------------
+check_security_services() {
+    log_info "[阶段 3/3] 安全服务状态检查..."
+    log_warn "============================================================"
+
+    local service_entries
+    service_entries=$(parse_cis_rules "$CIS_CONFIG" "REQUIRED_SERVICE")
+    if [ -z "$service_entries" ]; then
+        log_warn "  未配置必需安全服务，跳过检查。"
+        return 0
+    fi
+
+    while IFS= read -r svc; do
+        [ -z "$svc" ] && continue
+
+        local active=false enabled=false
+
+        # 检查服务是否运行
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            active=true
+        fi
+
+        # 检查服务是否已启用（开机自启）
+        if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+            enabled=true
+        fi
+
+        local status_icon="PASS"
+        if [ "$active" = false ]; then
+            log_error "  [FAIL] ${svc}: 未运行"
+            status_icon="FAIL"
+            ISSUES_FOUND=$((ISSUES_FOUND + 1))
+        elif [ "$enabled" = false ]; then
+            log_warn "  [WARN] ${svc}: 已运行但未设为开机自启"
+            status_icon="WARN"
+            ISSUES_FOUND=$((ISSUES_FOUND + 1))
+        else
+            log_success "  [PASS] ${svc}: 运行中 & 开机自启"
+        fi
+
+        if [ "$status_icon" != "PASS" ]; then
+            log_warn "    → 修复: systemctl enable --now ${svc}"
+        fi
+    done <<< "$service_entries"
+
+    log_warn "============================================================"
+}
+
+# ------------------------------------------------------------------
+# 辅助：输出安全评分
+# ------------------------------------------------------------------
+emit_security_summary() {
+    if [ "$JSON_OUTPUT" = true ]; then
+        return 0
+    fi
+    echo ""
+    echo "  ██████████████████████████████████████████████████████████████"
+    echo "  ▎              安全审计报告 (Security Audit)                ▎"
+    echo "  ██████████████████████████████████████████████████████████████"
+    echo ""
+    printf "  %-20s %s\n" "目标节点:" "$(hostname)"
+    printf "  %-20s %s\n" "CIS 规则:" "$CIS_CONFIG"
+
+    if [ "$ISSUES_FOUND" -eq 0 ]; then
+        printf "  %-20s \e[32m全部检查通过 ✓\e[0m\n" "审计结果:"
+    else
+        printf "  %-20s \e[31m发现 %s 项安全问题 ✗\e[0m\n" "审计结果:" "$ISSUES_FOUND"
+    fi
+    echo ""
+    echo "  建议操作:"
+    echo "  1. 所有 [FAIL] 项应立即修复，以符合 CIS 基线。"
+    echo "  2. 对于高危端口，确认是否为业务必需；若非必需，立即停止服务。"
+    echo "  3. 确保 auditd 正常运行，以满足审计合规要求。"
+    echo "  4. 修复后请重新运行 kn-security 验证。"
+    echo ""
+}
+
+# ------------------------------------------------------------------
+# 5. 主安全审计编排
+# ------------------------------------------------------------------
+main() {
+    # 日志轮转
+    cleanup_old_logs 30
+
+    log_info "========== 节点安全审计启动 =========="
+
+    audit_kubelet_config
+    echo ""
+    scan_risk_ports
+    echo ""
+    check_security_services
+    echo ""
+    emit_security_summary
+
+    # JSON 记录
+    json_record "audit_summary" "$(if [ "$ISSUES_FOUND" -gt 0 ]; then echo "fail"; else echo "pass"; fi)" \
+        "审计完成" \
+        "issues_found=${ISSUES_FOUND}" \
+        "cis_config=${CIS_CONFIG}"
+
+    if [ "$JSON_OUTPUT" = true ]; then
+        json_flush
+    fi
+
+    if [ "$ISSUES_FOUND" -gt 0 ]; then
+        log_warn "审计完成: ${ISSUES_FOUND} 项安全问题待修复。"
+        exit 1
+    else
+        log_success "审计完成: 全部通过。"
+        exit 0
+    fi
+}
+
+main
