@@ -1,0 +1,377 @@
+#!/usr/bin/env bash
+# ====================================================================
+# node-guardian: kn-backup
+# 云原生节点灾备工具 — 配置快照、完整性校验与闭环验证
+# ====================================================================
+
+# 1. 路径解析
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+readonly LIB_DIR
+CONFIG_DIR="$(dirname "$SCRIPT_DIR")/config"
+readonly CONFIG_DIR
+
+# 2. 引入基础库
+if [ ! -f "${LIB_DIR}/core.sh" ]; then
+    echo "ERROR: 找不到核心库 ${LIB_DIR}/core.sh" >&2
+    exit 1
+fi
+# shellcheck disable=SC1091
+source "${LIB_DIR}/core.sh"
+
+# 3. 默认参数
+BACKUP_CONF="${CONFIG_DIR}/backup_targets.conf"
+readonly BACKUP_CONF
+BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/node-guardian}"
+readonly BACKUP_ROOT
+BACKUP_ARCHIVE=""
+export BACKUP_ARCHIVE
+FAILED_TARGETS=0
+export FAILED_TARGETS
+
+usage() {
+    cat <<'EOF'
+用法: kn-backup [选项]
+
+云原生节点灾备工具。对 K8s 节点关键配置与状态文件创建带完整性校验的
+时间戳快照，支持灾备闭环验证。
+
+选项:
+  -h, --help         显示此帮助信息并退出
+  -v, --version      显示版本号并退出
+  --dry-run          预演模式，仅列出将要备份的目标，不实际执行
+  --config <path>    指定备份目标清单，默认 ${BACKUP_CONF}
+  --output <path>    指定备份输出目录，默认 ${BACKUP_ROOT}
+  --json             以 JSON 格式输出备份报告
+  --verify <archive> 验证指定备份归档的完整性
+EOF
+}
+
+# 4. 参数解析
+ACTION="backup"
+VERIFY_ARCHIVE=""
+OUTPUT_DIR="$BACKUP_ROOT"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -v|--version)
+            echo "kn-backup v${VERSION}"
+            exit 0
+            ;;
+        --dry-run)
+            export DRY_RUN=true
+            log_warn "DRY_RUN 模式已开启。"
+            shift
+            ;;
+        --json)
+            export JSON_OUTPUT=true
+            shift
+            ;;
+        --config)
+            BACKUP_CONF_OVERRIDE="$2"
+            shift 2
+            ;;
+        --output)
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        --verify)
+            ACTION="verify"
+            VERIFY_ARCHIVE="$2"
+            shift 2
+            ;;
+        *)
+            log_error "未知参数: $1"
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+CONF_FILE="${BACKUP_CONF_OVERRIDE:-$BACKUP_CONF}"
+
+# ------------------------------------------------------------------
+# 计算文件 SHA256 摘要
+# ------------------------------------------------------------------
+compute_sha256() {
+    sha256sum "$1" 2>/dev/null | awk '{print $1}'
+}
+
+# ------------------------------------------------------------------
+# 备份单个文件或目录（支持 exclude 规则与大小上限）
+# ------------------------------------------------------------------
+backup_target() {
+    local label="$1"
+    local path="$2"
+    local type="$3"
+    local dest_dir="$4"
+    local exclude_pattern="${5:-}"
+    local max_size_mb="${6:-0}"
+
+    if [ ! -e "$path" ]; then
+        log_warn "  [SKIP] ${label}: 路径不存在 → ${path}"
+        return 0
+    fi
+
+    # 大小检查（> 0 表示启用了上限）
+    if [ "$max_size_mb" -gt 0 ] 2>/dev/null; then
+        local size_kb=""
+        size_kb=$(du -sk "$path" 2>/dev/null | awk '{print $1}')
+        local size_mb=$((size_kb / 1024))
+        if [ "$size_mb" -gt "$max_size_mb" ]; then
+            log_warn "  [SKIP] ${label}: 大小 ${size_mb}M 超出上限 ${max_size_mb}M，跳过备份"
+            return 0
+        fi
+    fi
+
+    local dest_path="${dest_dir}/${label}"
+
+    case "$type" in
+        file)
+            if [ "$DRY_RUN" = true ]; then
+                log_warn "  [DRY-RUN] 将备份文件: ${path} → ${dest_path}"
+            else
+                cp -a "$path" "$dest_path"
+                log_success "  [OK] ${label}: ${path}"
+            fi
+            ;;
+        dir)
+            if [ "$DRY_RUN" = true ]; then
+                log_warn "  [DRY-RUN] 将备份目录: ${path} → ${dest_path}"
+            else
+                if [ -n "$exclude_pattern" ]; then
+                    # rsync may not be available; fall back to cp + selective copy
+                    mkdir -p "$dest_path"
+                    # Build find command with exclude patterns (comma-separated)
+                    # Build find args as an array to avoid eval injection risk.
+                    local find_args=("$path" "-mindepth" "1")
+                    local IFS=','
+                    local -a EXCLUDES
+                    read -ra EXCLUDES <<< "$exclude_pattern"
+                    local excl
+                    for excl in "${EXCLUDES[@]}"; do
+                        excl="${excl## }"
+                        excl="${excl%% }"
+                        [ -n "$excl" ] && find_args+=("-not" "-path" "*/${excl}/*" "-not" "-name" "${excl}")
+                    done
+                    find "${find_args[@]}" -print0 2>/dev/null | while IFS= read -r -d '' src; do
+                        rel="${src#"$path"/}"
+                        dest="${dest_path}/${rel}"
+                        mkdir -p "$(dirname "$dest")" 2>/dev/null
+                        cp -a "$src" "$dest" 2>/dev/null
+                    done
+                else
+                    cp -a "$path" "$dest_path"
+                fi
+                log_success "  [OK] ${label}: ${path}"
+            fi
+            ;;
+        *)
+            log_error "  [FAIL] ${label}: 未知类型 '${type}'"
+            return 1
+            ;;
+    esac
+}
+
+# ------------------------------------------------------------------
+# 灾备快照：打包备份目标并生成完整性校验
+# ------------------------------------------------------------------
+create_snapshot() {
+    local conf_file="$1"
+    local output_dir="$2"
+
+    log_info "========== 节点灾备快照启动 =========="
+
+    if [ ! -f "$conf_file" ]; then
+        log_error "备份目标清单丢失: ${conf_file}"
+        return 1
+    fi
+
+    if [ "$DRY_RUN" = false ]; then
+        mkdir -p "$output_dir"
+    fi
+
+    local timestamp=""
+    timestamp="$(date +'%Y%m%d_%H%M%S')"
+    local host=""
+    host="$(hostname)"
+    local snapshot_dir="${output_dir}/${host}_${timestamp}"
+    local archive_file="${output_dir}/${host}_${timestamp}.tar.gz"
+    local checksum_file="${archive_file}.sha256"
+
+    export BACKUP_ARCHIVE="$archive_file"
+
+    log_info "快照目录: ${snapshot_dir}"
+    log_info "归档路径: ${archive_file}"
+
+    if [ "$DRY_RUN" = true ]; then
+        log_warn "[DRY-RUN] 将创建快照目录: ${snapshot_dir}"
+    else
+        mkdir -p "$snapshot_dir"
+    fi
+
+    # 记录备份元信息
+    if [ "$DRY_RUN" = false ]; then
+        {
+            echo "hostname: ${host}"
+            echo "timestamp: ${timestamp}"
+            echo "node-guardian version: ${VERSION}"
+            echo "kernel: $(uname -r)"
+            echo "targets:"
+            while IFS='|' read -r label path type exclude_rule max_size || [ -n "$label" ]; do
+                [[ -z "$label" || "$label" == \#* ]] && continue
+                label=$(echo "$label" | xargs)
+                path=$(echo "$path" | xargs)
+                type=$(echo "$type" | xargs)
+                echo "  - ${label}: ${path} (${type})"
+            done < "$conf_file"
+        } > "${snapshot_dir}/backup_manifest.yaml"
+    fi
+
+    # 遍历备份目标（支持扩展列: exclude_pattern 与 max_size_mb）
+    local total=0 success=0
+    while IFS='|' read -r label path type exclude_rule max_size || [ -n "$label" ]; do
+        [[ -z "$label" || "$label" == \#* ]] && continue
+        label=$(echo "$label" | xargs)
+        path=$(echo "$path" | xargs)
+        type=$(echo "$type" | xargs)
+        exclude_rule="${exclude_rule:-}"  # 可选列
+        exclude_rule=$(echo "$exclude_rule" | xargs)
+        max_size="${max_size:-0}"          # 可选列
+        max_size=$(echo "$max_size" | xargs)
+        total=$((total + 1))
+
+        if backup_target "$label" "$path" "$type" "$snapshot_dir" "$exclude_rule" "$max_size"; then
+            success=$((success + 1))
+        else
+            FAILED_TARGETS=$((FAILED_TARGETS + 1))
+        fi
+    done < "$conf_file"
+
+    # 打包归档并生成校验
+    if [ "$DRY_RUN" = false ]; then
+        log_info "正在打包归档..."
+        tar -czf "$archive_file" -C "$(dirname "$snapshot_dir")" "$(basename "$snapshot_dir")" 2>/dev/null
+        compute_sha256 "$archive_file" > "$checksum_file"
+        local sha_val=""
+        sha_val=$(cat "$checksum_file")
+        log_success "归档完成: ${archive_file}"
+        log_info "SHA256: ${sha_val}"
+
+        # 清理临时快照目录（保留归档）
+        rm -rf "$snapshot_dir"
+        log_info "已清理临时快照目录。"
+    else
+        log_warn "[DRY-RUN] 将打包归档: ${archive_file}"
+    fi
+
+    # 输出备份摘要
+    if [ "$JSON_OUTPUT" != true ]; then
+        echo ""
+        echo "  ██████████████████████████████████████████████████████████████"
+        echo "  ▎              灾备快照报告 (Backup Report)                ▎"
+        echo "  ██████████████████████████████████████████████████████████████"
+        echo ""
+        printf "  %-20s %s\n" "目标节点:" "$host"
+        printf "  %-20s %s/%s\n" "备份结果:" "$success" "$total"
+        if [ "$FAILED_TARGETS" -gt 0 ]; then
+            printf "  %-20s \e[31m%s 项失败\e[0m\n" "" "$FAILED_TARGETS"
+        fi
+
+        if [ "$DRY_RUN" = false ] && [ -f "$archive_file" ]; then
+            printf "  %-20s %s\n" "归档路径:" "$archive_file"
+            printf "  %-20s %s\n" "归档大小:" "$(du -h "$archive_file" | awk '{print $1}')"
+        fi
+        echo ""
+    fi
+}
+
+# ------------------------------------------------------------------
+# 灾备闭环验证：校验归档完整性
+# ------------------------------------------------------------------
+verify_archive() {
+    local archive_file="$1"
+
+    log_info "========== 灾备闭环验证 =========="
+
+    if [ ! -f "$archive_file" ]; then
+        log_error "归档文件不存在: ${archive_file}"
+        return 1
+    fi
+
+    local checksum_file="${archive_file}.sha256"
+
+    if [ ! -f "$checksum_file" ]; then
+        log_warn "未找到校验文件: ${checksum_file}，无法验证完整性。"
+        log_info "归档大小: $(du -h "$archive_file" | awk '{print $1}')"
+        return 1
+    fi
+
+    log_info "正在验证归档完整性..."
+    local expected=""
+    expected=$(cat "$checksum_file")
+    local actual=""
+    actual=$(compute_sha256 "$archive_file")
+
+    echo ""
+    echo "  ██████████████████████████████████████████████████████████████"
+    echo "  ▎            灾备完整性验证 (Integrity Verify)             ▎"
+    echo "  ██████████████████████████████████████████████████████████████"
+    echo ""
+    printf "  %-20s %s\n" "归档文件:" "$archive_file"
+    printf "  %-20s %s\n" "预期 SHA256:" "$expected"
+    printf "  %-20s %s\n" "实际 SHA256:" "$actual"
+
+    if [ "$expected" = "$actual" ]; then
+        log_success "完整性验证通过 — 归档未损坏。"
+        echo ""
+        log_info "归档内容预览:"
+        tar -tzf "$archive_file" 2>/dev/null | head -20
+        echo "  ... (共 $(tar -tzf "$archive_file" 2>/dev/null | wc -l) 个条目)"
+        return 0
+    else
+        log_error "完整性验证失败 — SHA256 不匹配！归档可能已损坏。"
+        return 1
+    fi
+}
+
+# ------------------------------------------------------------------
+# 5. 主编排
+# ------------------------------------------------------------------
+main() {
+    # 日志轮转
+    cleanup_old_logs 30
+
+    case "$ACTION" in
+        backup)
+            create_snapshot "$CONF_FILE" "$OUTPUT_DIR"
+            json_record "backup_summary" "$(if [ "$FAILED_TARGETS" -gt 0 ]; then echo "partial"; else echo "success"; fi)" \
+                "灾备完成" \
+                "failed_targets=${FAILED_TARGETS}" \
+                "output_dir=${OUTPUT_DIR}"
+            if [ "$JSON_OUTPUT" = true ]; then
+                json_flush
+            fi
+            if [ "$FAILED_TARGETS" -gt 0 ]; then
+                log_warn "灾备完成: ${FAILED_TARGETS} 个目标备份失败。"
+                exit 1
+            else
+                log_success "灾备完成: 全部目标备份成功。"
+                exit 0
+            fi
+            ;;
+        verify)
+            verify_archive "$VERIFY_ARCHIVE" || exit 1
+            if [ "$JSON_OUTPUT" = true ]; then
+                json_flush
+            fi
+            ;;
+    esac
+}
+
+main
