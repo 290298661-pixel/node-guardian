@@ -1,85 +1,95 @@
 <p align="center">
   <h1 align="center">🛡️ Node Guardian</h1>
-  <p align="center"><strong>云原生节点轻量级运维工具箱 / Lightweight Cloud-Native Node Operations Toolkit for Kubernetes</strong></p>
+  <p align="center"><strong>云原生节点轻量级运维工具箱 / Lightweight Node Operations Toolkit for Kubernetes</strong></p>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/bash-4.2%2B-brightgreen" alt="Bash 4.2+">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License">
   <img src="https://img.shields.io/badge/platform-linux%2Famd64-lightgrey" alt="Linux/amd64">
-  <img src="https://github.com/noneedtostudy/node-guardian/actions/workflows/lint.yml/badge.svg" alt="CI">
+  <img src="https://github.com/290298661-pixel/node-guardian/actions/workflows/lint.yml/badge.svg" alt="CI">
 </p>
-
----
-
-## 目录 / Table of Contents
-
-- [概述](#概述)
-- [快速开始](#快速开始)
-- [工具集](#工具集)
-- [架构](#架构)
-- [配置说明](#配置说明)
-- [开发](#开发)
-- [贡献](#贡献)
-- [许可证](#许可证)
-- [English](#english)
 
 ---
 
 ## 概述
 
-**Node Guardian** 是一款为 Kubernetes 工作节点与控制平面节点 Day-2 运维场景量身打造的轻量级 Bash 工具集。它以高内聚、幂等、防御性编程的工具链取代传统运维脚本的"一把梭"模式。
+**Node Guardian** 是 K8s 节点 Day-2 运维的 Bash 工具箱——把常见故障的排障经验编码为四个开箱即用的命令。conntrack 表耗尽、MTU 不匹配、kubelet 配置漂移、高负载进程找不到对应 Pod……凌晨三点被叫醒才翻 wiki 太晚了。Node Guardian 把这些写成了 `kn-diagnose` 一个命令。
 
-### 为什么需要 Node Guardian？
+### 它在工具链中的位置
 
-云原生集群的故障模式高度可预测：conntrack 表耗尽、MTU 不匹配、kubelet 参数配置不当、高负载进程无法追溯到 Pod。大多数团队在凌晨三点被电话叫醒时才仓促应对。Node Guardian 将这些排障经验编码为开箱即用的工具链。
+Node Guardian 是 [三部曲](https://github.com/290298661-pixel) 的**第一环**——"响应层"：
+
+| 项目 | 语言 | 回答的问题 |
+|------|------|-----------|
+| **Node Guardian** ← 你在这里 | Bash | 出了故障怎么排查和修复？ |
+| [Node Health Watcher](https://github.com/290298661-pixel/node-health-watcher) | Python | 什么时候该去排查？ |
+| [Game Fleet Director](https://github.com/290298661-pixel/game-server-orchestrator) | Go | 谁来操作游戏服本身？ |
+
+**选 Bash 是因为** K8s 节点自带 Bash，没有运行时依赖、没有版本漂移。当你只能 SSH 进一台故障节点时，Bash 就是你仅有的武器。`crictl`、`conntrack`、`jq` 都是可选的——缺失时工具会优雅降级。
 
 ### 核心原则
 
-| 原则 | 实现方式 |
-|------|---------|
-| **幂等性** | 一切变更操作先比对当前状态再执行；反复运行始终安全 |
-| **防御性执行** | 全链路 `set -euo pipefail`、信号捕获 (EXIT/INT/TERM)、命令注入元字符拦截 |
-| **干运行优先** | 所有工具支持 `--dry-run` — 先预览变更，确认后再正式执行 |
-| **可组合性** | 共享 `lib/` 模块使入口脚本保持轻薄、可测试 |
+| 原则 | 实现 |
+|------|------|
+| **幂等** | 先比对再变更，反复运行始终安全 |
+| **防御性** | `set -euo pipefail` 全链路 + 命令注入元字符拦截 + 信号捕获 |
+| **干运行优先** | 四个工具全部支持 `--dry-run`，先预览再执行 |
+| **可测试** | 共享 `lib/` 模块，BATS 测试通过 mock PATH 注入，无需 root |
 
 ---
 
 ## 快速开始
 
 ```bash
-# 在任意 K8s 节点上克隆仓库
-git clone https://github.com/noneedtostudy/node-guardian.git
-cd node-guardian
+git clone https://github.com/290298661-pixel/node-guardian.git && cd node-guardian
 
-# 查看工具版本
-./bin/kn-preflight --version
-
-# 预演模式 — 仅展示将要修改的内容，不做实质性变更
+# 预演内核调优，只看不改
 sudo ./bin/kn-preflight --dry-run
 
-# 正式执行节点内核调优与加固
+# 正式执行
 sudo ./bin/kn-preflight
 
-# 节点异常时，5 分钟内完成排障信息收集
+# 节点挂了？五分钟收集所有关键信息
 sudo ./bin/kn-diagnose --minutes 15 --top 5
 
-# 基于 CIS 基线审计节点安全态势（JSON 输出便于接入监控系统）
-sudo ./bin/kn-security --json
+# 安全基线审计（退出码 1 = 有未通过项，适合 CI/CD 卡点）
+sudo ./bin/kn-security
 
-# 在变更窗口前创建节点配置快照
+# 变更窗口前创建带 SHA256 校验的配置快照
 sudo ./bin/kn-backup --output /var/backups/node-guardian
-
-# 以结构化 JSON 输出诊断结果
-sudo ./bin/kn-diagnose --minutes 15 --top 5 --json
 ```
 
-### 环境要求
+**环境：** Bash 4.2+ · Linux 内核 4.x+ · Root 权限 · 可选：`jq` `crictl` `conntrack`
 
-- **Bash 4.2+**
-- **Linux 内核 4.x+**（conntrack、sysctl、cgroups v1/v2）
-- **Root 权限**（sysctl 写入、服务状态检查、日志读取必需）
-- **可选依赖（推荐安装）：** `jq`、`crictl`、`conntrack`、`journalctl`
+---
+
+## 架构
+
+```
+.
+├── bin/                        # 四个可执行入口
+│   ├── kn-preflight            # 节点准入预检 + 内核加固
+│   ├── kn-diagnose             # "黄金五分钟"排障（负载→Pod溯源→网络→日志）
+│   ├── kn-security             # CIS 安全基线审计
+│   └── kn-backup               # 灾备快照 + SHA256 闭环验证
+├── lib/                        # 共享库（被四个工具复用）
+│   ├── core.sh                 # 日志、trap、安全命令执行器 run_cmd
+│   ├── sysctl.sh               # 内核参数幂等审计与持久化
+│   ├── network.sh              # MTU 一致性、Conntrack 分级告警
+│   └── k8s-utils.sh            # 运行时检测、PID→Pod 溯源、日志提取
+├── config/                     # 基线配置（sysctl / CIS 规则 / 备份目标）
+├── tests/                      # BATS 测试套件（6 个文件，50+ 用例）
+└── .github/workflows/lint.yml  # CI：ShellCheck + BATS
+```
+
+### 设计决策
+
+**为什么每个工具都支持 `--dry-run`？** Day-2 运维面向生产节点，任何变更必须先可预览。`core.sh` 的 `run_cmd` 是全局门禁——`$DRY_RUN=true` 时只记录不执行，命令替换（`$()`、反引号）始终被拦截。
+
+**为什么支持 `--json`？** 四个工具全部支持结构化 JSON 输出，可直接接入 Prometheus textfile collector、ELK/Loki 或 CI/CD 流水线。JSON 模式会静默终端日志，仅 stdout 输出。
+
+**日志轮转** —— 每次启动自动清理 `/var/log/kn-guardian_*.log` 中超过 30 天的旧文件。
 
 ---
 
@@ -89,121 +99,50 @@ sudo ./bin/kn-diagnose --minutes 15 --top 5 --json
 
 新节点加入集群前，验证并加固内核参数、容器运行时及网络配置。
 
+**执行阶段：**
+1. **权限检查** — 验证 root 执行上下文
+2. **内核调优** — 审计并幂等应用 8 项 sysctl 参数
+3. **容器运行时检测** — 自动识别 containerd / docker，探测 cgroup 驱动并与 kubelet 交叉校验
+4. **MTU 一致性** — 对比物理网卡与 CNI 虚拟网卡 MTU
+
 ```
 用法: kn-preflight [--dry-run] [--json] [--version]
 ```
 
-**执行阶段：**
-1. **权限检查** — 验证 root 执行上下文
-2. **内核调优** — 审计并幂等应用 8 项关键 sysctl 参数（somaxconn、tcp_tw_reuse、bridge-nf-call、inotify watches 等）
-3. **容器运行时检测** — 自动识别 containerd / docker，探测 cgroup 驱动并与 kubelet 交叉校验
-4. **MTU 一致性** — 对比物理网卡与 CNI 虚拟网卡 MTU，标记 overlay 封装风险
-
-**输出示例：**
-```
-[2026-05-24 10:15:32] [OK] [kn-preflight] [PASS] net.core.somaxconn = 32768
-[2026-05-24 10:15:32] [WARN] [kn-preflight] [DIFF] net.ipv4.tcp_tw_reuse (当前: 0, 预期: 1)
-[2026-05-24 10:15:32] [OK] [kn-preflight] 容器运行时: containerd
-[2026-05-24 10:15:32] [OK] [kn-preflight] Cgroup 驱动: systemd
-```
-
 ### kn-diagnose —「黄金五分钟」排障
 
-当节点 NotReady 时，这是你的第一个命令。一键收集系统负载、Pod 溯源、网络诊断与关键错误日志。
+节点 NotReady 时的第一个命令。一键完成负载快照 → Pod 溯源 → 网络诊断 → 关键日志提取。
+
+**执行阶段：**
+1. **系统负载快照** — 主机名、uptime、load vs CPU、内存、磁盘
+2. **Pod 逆向溯源** — Top-N PID → `/proc/<pid>/cgroup` → 容器 ID → `crictl inspect` → Pod/Namespace
+3. **网络诊断** — Conntrack 使用率（85%/95% 分级）、TIME_WAIT 堆积、MTU 审计
+4. **关键日志** — 按 `error|timeout|deadline|panic|oom|backoff` 过滤 kubelet/containerd/docker
 
 ```
 用法: kn-diagnose [--dry-run] [--json] [--minutes <N>] [--top <N>] [--version]
 ```
 
-**执行阶段：**
-1. **系统负载快照** — 主机名、运行时长、内核版本、负载均值 vs CPU 核数、内存使用率、关键挂载点磁盘占用
-2. **Pod 逆向溯源** — 取内存占用 Top-N PID，通过 `/proc/<pid>/cgroup` → 容器 ID → `crictl inspect` 反查 K8s Pod 名与 Namespace
-3. **网络诊断** — Conntrack 表使用率（85%/95% 分级告警）、TIME_WAIT 缓解检查、MTU 一致性审计
-4. **关键日志提取** — 在指定时间窗口内，从 kubelet / containerd / docker 日志中按 `error|timeout|deadline|panic|oom|backoff` 模式过滤错误
-
 ### kn-security — 安全基线审计
 
-基于 CIS 规范的三阶段只读扫描，提供可操作的修复建议。退出码 1 表示存在未通过项，适合接入 CI/CD 卡点。
+基于 CIS 规范的三阶段只读扫描，退出码 1 = 存在未通过项，直接接入 CI/CD 卡点。
+
+1. **kubelet 加固** — 审计 `anonymous-auth`、`read-only-port`、`authorization-mode`
+2. **高危端口扫描** — 检查 12 项不应在节点上监听的端口
+3. **安全服务** — 验证 `auditd` 等必需服务运行且开机自启
 
 ```
 用法: kn-security [--dry-run] [--json] [--config <path>] [--version]
 ```
 
-**执行阶段：**
-1. **kubelet 加固** — 审计 `anonymous-auth`、`read-only-port`、`authorization-mode` 三项关键参数
-2. **高危端口扫描** — 检查 12 项不应在 K8s 节点上监听的端口（FTP、Telnet、SMTP、RPCBIND、SMB、NFS、未认证 Redis/MongoDB 等）
-3. **安全服务检查** — 验证 `auditd` 等必需服务处于运行状态且已设开机自启
-
 ### kn-backup — 灾备快照
 
-在变更窗口前创建带完整性校验的节点配置快照，支持闭环验证。
+变更窗口前创建时间戳 gzip 归档 + SHA256 校验。支持目录 exclude、大小上限、`--verify` 闭环验证。
 
 ```
 用法: kn-backup [--dry-run] [--json] [--config <path>] [--output <path>] [--version]
      kn-backup --verify <archive.tar.gz>
 ```
-
-**功能特性：**
-- 时间戳命名 gzip 归档，覆盖 kubelet 状态、容器运行时配置、CNI 配置、sysctl 持久化文件、静态 Pod 清单
-- 每个归档伴随 SHA256 校验文件
-- `--verify` 模式实现闭环灾备验证：重新计算摘要并检查归档可读性
-- 所有备份目标通过 `config/backup_targets.conf` 可配置
-- 支持目录级 **exclude 规则**（逗号分隔的通配模式），避免备份容器日志等大体积临时数据
-- 支持 **大小上限**（max_size_mb），超出阈值的路径自动跳过，防止备份膨胀
-
----
-
-## 架构
-
-```
-.
-├── bin/                        # 可执行入口
-│   ├── kn-preflight            # 节点准入预检
-│   ├── kn-diagnose             # "黄金五分钟"排障
-│   ├── kn-security             # CIS 安全审计
-│   └── kn-backup               # 灾备快照
-├── lib/                        # 共享库模块
-│   ├── core.sh                 # 日志、trap 信号处理、安全命令执行器
-│   ├── sysctl.sh               # 内核参数幂等审计
-│   ├── network.sh              # MTU 一致性、Conntrack 分析
-│   └── k8s-utils.sh            # 容器运行时检测、Pod 溯源、日志提取
-├── config/                     # 基线配置文件
-│   ├── sysctl_baseline.env     # 生产内核参数基线
-│   ├── cis_rules.cfg           # CIS 规则（kubelet、端口、服务）
-│   └── backup_targets.conf     # 灾备目标清单
-├── tests/                      # BATS 单元测试套件
-│   ├── test_helper.bash        # 测试 Harness（断言与 Mock 支持）
-│   ├── test_core.bats          # 核心库测试（日志、干运行、trap、清理）
-│   ├── test_sysctl.bats        # sysctl 幂等性、差异检测、干运行穿透
-│   ├── test_network.bats       # 网络库测试（MTU 一致性、Conntrack 分级告警）
-│   └── test_k8s_utils.bats     # K8s 工具库测试（运行时检测、Pod 溯源、日志提取）
-├── .github/workflows/
-│   └── lint.yml                # CI: ShellCheck + BATS 测试
-├── init_workspace.sh           # 开发者工作区引导脚本
-└── README.md
-```
-
-### 设计决策
-
-**为什么用 Bash 而不是 Go/Python？**
-K8s 节点自带 Bash — 无需运行时依赖、无需二进制分发、无版本漂移。当你只能通过 SSH 访问一台故障节点时，Bash 就是你仅有的武器。
-
-**`crictl` / `conntrack` / `jq` 怎么办？**
-均为可选依赖。工具会优雅降级：缺少 `crictl` 时 Pod 溯源终止于容器 ID；缺少 `conntrack` 时仍可通过 `/proc/sys` 计数器完成使用率分析。
-
-**为什么每个工具都支持 `--dry-run`？**
-Day-2 运维面向生产节点。一切变更操作必须在执行前可预览。`core.sh` 中的 `run_cmd` 门禁强制执行这一点 — 任何库函数都无法绕过。`run_cmd` 的注入防护采用分层策略：始终拒绝命令替换（`$()`、反引号），但允许 `&&`/`||` 条件串联以便合法操作链式执行。
-
-**JSON 输出模式**
-所有工具均支持 `--json` 标志，以结构化 JSON 格式输出报告。启用后终端日志将被静默，仅 stdout 输出 JSON。适用于接入 Prometheus textfile collector、日志平台（ELK/Loki）或 CI/CD 流水线结果解析。
-
-```bash
-# 安全审计 JSON 输出示例
-sudo ./bin/kn-security --json | jq '.results[] | select(.status=="fail")'
-```
-
-**日志轮转**
-每次工具启动时自动清理 `/var/log/kn-guardian_*.log` 中超过 30 天的旧日志文件，防止磁盘累积。保留天数可通过 `cleanup_old_logs` 函数参数调整。
 
 ---
 
@@ -314,7 +253,7 @@ bats tests/ --recursive
 
 ## 许可证
 
-MIT © 2026 [Shaohan He](https://github.com/noneedtostudy)
+MIT © 2026 [Shaohan He](https://github.com/290298661-pixel)
 
 ---
 
@@ -341,7 +280,7 @@ Cloud-native clusters fail in predictable ways: conntrack table exhaustion, MTU 
 
 ```bash
 # Clone the repository on any K8s node
-git clone https://github.com/noneedtostudy/node-guardian.git
+git clone https://github.com/290298661-pixel/node-guardian.git
 cd node-guardian
 
 # Preview what preflight would change (safe, read-only preview)
@@ -583,4 +522,4 @@ PRs are automatically linted and tested via GitHub Actions.
 
 ## License
 
-MIT © 2026 [Shaohan He](https://github.com/noneedtostudy)
+MIT © 2026 [Shaohan He](https://github.com/290298661-pixel)
