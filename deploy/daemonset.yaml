@@ -1,0 +1,109 @@
+# Node Guardian — DaemonSet
+# 在每个节点上运行，提供 kn-preflight / kn-diagnose / kn-security / kn-backup
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: node-guardian-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: node-guardian-privileged
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: node-guardian-clusterrole
+subjects:
+  - kind: ServiceAccount
+    name: node-guardian-sa
+    namespace: node-guardian-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: node-guardian-clusterrole
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods", "events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: node-guardian-sa
+  namespace: node-guardian-system
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-guardian
+  namespace: node-guardian-system
+  labels:
+    app: node-guardian
+spec:
+  selector:
+    matchLabels:
+      app: node-guardian
+  template:
+    metadata:
+      labels:
+        app: node-guardian
+    spec:
+      serviceAccountName: node-guardian-sa
+      hostNetwork: true
+      hostPID: true
+      hostIPC: true
+      containers:
+        - name: node-guardian
+          image: ghcr.io/290298661-pixel/node-guardian:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+              readOnly: true
+            - name: host-proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: host-sys
+              mountPath: /host/sys
+              readOnly: true
+            - name: host-log
+              mountPath: /host/var/log
+              readOnly: true
+            - name: guardian-log
+              mountPath: /var/log/node-guardian
+            - name: guardian-backup
+              mountPath: /var/backup/node-guardian
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
+        - name: host-proc
+          hostPath:
+            path: /proc
+        - name: host-sys
+          hostPath:
+            path: /sys
+        - name: host-log
+          hostPath:
+            path: /var/log
+        - name: guardian-log
+          hostPath:
+            path: /var/log/node-guardian
+            type: DirectoryOrCreate
+        - name: guardian-backup
+          hostPath:
+            path: /var/backup/node-guardian
+            type: DirectoryOrCreate
+      tolerations:
+        - operator: Exists
