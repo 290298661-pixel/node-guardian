@@ -26,7 +26,7 @@
 
 ## 概述
 
-**Node Guardian** 是 K8s 节点 Day-2 运维的 Bash 工具箱——把常见故障的排障经验编码为四个开箱即用的命令。conntrack 表耗尽、MTU 不匹配、kubelet 配置漂移、高负载进程找不到对应 Pod……凌晨三点被叫醒才翻 wiki 太晚了。Node Guardian 把这些写成了 `kn-diagnose` 一个命令。
+**Node Guardian** 是 K8s 节点 Day-2 运维的 Bash 工具箱——把常见故障的排障经验编码为四个开箱即用的命令。(conntrack 表耗尽、MTU 不匹配、kubelet 配置漂移、高负载进程找不到对应) Node Guardian 把这些写成了 `kn-diagnose` 一个命令。
 
 ### 它在工具链中的位置
 
