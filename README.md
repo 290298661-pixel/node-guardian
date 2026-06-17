@@ -26,7 +26,7 @@
 
 ## 概述
 
-**Node Guardian** 是 K8s 节点 Day-2 运维的 Bash 工具箱——把常见故障的排障经验编码为四个开箱即用的命令。(conntrack 表耗尽、MTU 不匹配、kubelet 配置漂移、高负载进程找不到对应) Node Guardian 把这些写成了 `kn-diagnose` 一个命令。
+**Node Guardian** 是 K8s 节点运维的 Bash 工具箱——把常见故障的排障经验编码为四个开箱即用的命令。(1,conntrack 表耗尽、2,MTU 不匹配、3,kubelet 配置漂移、4,高负载进程找不到对应) Node Guardian 把这些写成了 `kn-diagnose` 一个命令。
 
 ### 它在工具链中的位置
 
@@ -38,7 +38,7 @@ Node Guardian 是 [三部曲](https://github.com/290298661-pixel) 的**第一环
 | [Node Health Watcher](https://github.com/290298661-pixel/node-health-watcher) | Python | 什么时候该去排查？ |
 | [Game Fleet Director](https://github.com/290298661-pixel/game-server-orchestrator) | Go | 谁来操作游戏服本身？ |
 
-**选 Bash 是因为** K8s 节点自带 Bash，没有运行时依赖、没有版本漂移。当你只能 SSH 进一台故障节点时，Bash 就是你仅有的武器。`crictl`、`conntrack`、`jq` 都是可选的——缺失时工具会优雅降级。
+** Bash ** K8s 节点自带 Bash，没有运行时依赖、没有版本漂移。当只能 SSH 进一台故障节点时，Bash 就是仅有的。`crictl`、`conntrack`、`jq` 都是可选的——一缺失时工具会优雅降级。
 
 ### 核心原则
 
