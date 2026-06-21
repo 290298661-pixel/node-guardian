@@ -15,7 +15,9 @@ SCRIPT_NAME="$(basename "$0")"
 readonly SCRIPT_NAME
 TIMESTAMP="$(date +'%Y-%m-%d_%H-%M-%S')"
 readonly TIMESTAMP
-readonly LOG_FILE="/var/log/kn-guardian_${TIMESTAMP}.log"
+LOG_DIR="${NODE_GUARDIAN_LOG_DIR:-/var/log}"
+readonly LOG_DIR
+readonly LOG_FILE="${LOG_DIR}/kn-guardian_${TIMESTAMP}.log"
 
 # 版本号（唯一来源，所有工具通过 source core.sh 继承）
 readonly VERSION="0.2.0"
@@ -211,7 +213,7 @@ require_command() {
 # $1: 保留天数（默认 30）
 cleanup_old_logs() {
     local retention_days="${1:-30}"
-    local log_dir="/var/log"
+    local log_dir="$LOG_DIR"
 
     if [ ! -d "$log_dir" ] || [ ! -w "$log_dir" ]; then
         return 0
