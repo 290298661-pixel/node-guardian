@@ -55,7 +55,7 @@ spec:
       hostPID: true
       containers:
         - name: node-guardian
-          image: ghcr.io/290298661-pixel/node-guardian:latest
+          image: ghcr.io/Shaohan-He/node-guardian:latest
           imagePullPolicy: IfNotPresent
           env:
             - name: NODE_GUARDIAN_LOG_DIR

@@ -29,7 +29,7 @@ Node Guardian 是一组面向 Kubernetes 节点的 Bash 运维工具。它把常
 ## 快速开始
 
 ```bash
-git clone https://github.com/290298661-pixel/node-guardian.git
+git clone https://github.com/Shaohan-He/node-guardian.git
 cd node-guardian
 
 # 预览节点预检会执行的变更
@@ -169,10 +169,10 @@ bats tests/ --recursive
 
 | 仓库 | 关系 |
 | --- | --- |
-| [node-health-watcher](https://github.com/290298661-pixel/node-health-watcher) | 可在发现节点异常后触发人工或自动诊断流程 |
-| [fleet-observability](https://github.com/290298661-pixel/fleet-observability) | 可采集 Node Guardian 输出的日志或 textfile 指标 |
-| [fleet-gitops](https://github.com/290298661-pixel/fleet-gitops) | 可管理 DaemonSet 或 Job 形式的部署配置 |
+| [node-health-watcher](https://github.com/Shaohan-He/node-health-watcher) | 可在发现节点异常后触发人工或自动诊断流程 |
+| [fleet-observability](https://github.com/Shaohan-He/fleet-observability) | 可采集 Node Guardian 输出的日志或 textfile 指标 |
+| [fleet-gitops](https://github.com/Shaohan-He/fleet-gitops) | 可管理 DaemonSet 或 Job 形式的部署配置 |
 
 ## License
 
-MIT © 2026 [Shaohan He](https://github.com/290298661-pixel)
+MIT © 2026 [Shaohan He](https://github.com/Shaohan-He)

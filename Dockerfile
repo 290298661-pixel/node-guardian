@@ -1,10 +1,10 @@
 # Node Guardian — K8s 节点运维工具箱
 # 部署为 DaemonSet，在集群每个节点上运行诊断/安全/备份工具
-# 镜像构建: docker build -t ghcr.io/290298661-pixel/node-guardian:latest .
+# 镜像构建: docker build -t ghcr.io/Shaohan-He/node-guardian:latest .
 
 FROM alpine:3.21
 
-LABEL org.opencontainers.image.source="https://github.com/290298661-pixel/node-guardian"
+LABEL org.opencontainers.image.source="https://github.com/Shaohan-He/node-guardian"
 LABEL org.opencontainers.image.description="K8s node ops toolkit — preflight, diagnose, security, backup"
 
 # 安装必要工具
